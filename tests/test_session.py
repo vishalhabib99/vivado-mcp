@@ -840,3 +840,111 @@ class TestTclServerScript:
             "a" + "".join(chr(i) for i in range(32)) + "\\ \" end"
         )
         assert obj["output"] == expect, "控制字符必须无损往返"
+
+    def test_start_call_guarded_by_gui_mode(self, tcl_source):
+        """脚本末尾的 ::vmcp::start 只在 GUI(或无 rdi::mode)立即调用,其余推迟判断。
+
+        已 install 的机器上 tcl/batch 模式也会 source 本脚本;不拦就会抢 9999,
+        mode="gui" 默认 probe 9999 时接管到看不见的无界面会话。
+        但 init.tcl 阶段 GUI 的 rdi::mode 也是 "tcl",所以不能直接放弃,只能 after idle 推迟。
+        """
+        import re
+
+        assert re.search(
+            r'if \{!\[info exists ::rdi::mode\] \|\| \$::rdi::mode eq "gui"\} \{\s*'
+            r"::vmcp::start\s*\} else \{[^}]*after idle ::vmcp::deferred_start\s*\}",
+            tcl_source,
+        ), "非 GUI 加载时必须 after idle 推迟,而不是直接放弃或立即启动"
+        body = tcl_source[tcl_source.index("proc ::vmcp::deferred_start") :]
+        assert re.search(r'if \{\$server_sock ne ""\} \{\s*return', body), (
+            "延迟回调必须在 server 已启动时跳过,不能 rebind 关掉分配端口"
+        )
+
+    @staticmethod
+    def _run_tclsh(tmp_path, lines: list[str]) -> str:
+        import shutil
+        import subprocess
+
+        tclsh = shutil.which("tclsh")
+        if tclsh is None:
+            pytest.skip("tclsh 不在 PATH,跳过 Tcl 功能验证")
+        driver = tmp_path / "driver.tcl"
+        driver.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        proc = subprocess.run(
+            [tclsh, str(driver)], capture_output=True, text=True, timeout=30
+        )
+        assert proc.returncode == 0, f"tclsh 执行失败: {proc.stderr!r}"
+        return proc.stdout
+
+    @staticmethod
+    def _free_port() -> int:
+        import socket
+
+        # 测试绝不用 9999(开发机可能真有 Vivado 在跑),用 OS 分配的空闲端口
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+
+    @pytest.mark.parametrize("mode", ["tcl", "batch"])
+    def test_headless_mode_never_listens_via_tclsh(self, tcl_path, tmp_path, mode):
+        """tcl/batch:加载时不监听;事件循环跑到延迟回调后仍不监听。"""
+        port = self._free_port()
+        out = self._run_tclsh(tmp_path, [
+            "namespace eval ::rdi {}",
+            f"set ::rdi::mode {mode}",
+            f"set ::VMCP_PORT_PREF {port}",
+            f'source "{tcl_path.as_posix()}"',
+            'puts "LOAD_PORT=$::vmcp::active_port"',
+            "update",
+            'puts "IDLE_PORT=$::vmcp::active_port"',
+        ])
+        assert "LOAD_PORT=0" in out and "IDLE_PORT=0" in out, out
+        assert f"vivado-mcp: {mode} mode, server not started" in out
+
+    @pytest.mark.parametrize("mode", ["gui", None])
+    def test_gui_or_plain_tclsh_starts_immediately_via_tclsh(
+        self, tcl_path, tmp_path, mode
+    ):
+        """-source 阶段 mode 已是 gui / 裸 tclsh:加载时立即监听(不依赖事件循环)。"""
+        port = self._free_port()
+        lines = ["namespace eval ::rdi {}", f"set ::rdi::mode {mode}"] if mode else []
+        out = self._run_tclsh(tmp_path, lines + [
+            f"set ::VMCP_PORT_PREF {port}",
+            f'source "{tcl_path.as_posix()}"',
+            'puts "LOAD_PORT=$::vmcp::active_port"',
+        ])
+        assert f"LOAD_PORT={port}" in out, out
+
+    def test_gui_from_init_tcl_starts_in_event_loop_via_tclsh(self, tcl_path, tmp_path):
+        """用户手动开的 GUI:init.tcl 阶段 mode 是 tcl,事件循环里变成 gui 后才启动。"""
+        port = self._free_port()
+        out = self._run_tclsh(tmp_path, [
+            "namespace eval ::rdi {}",
+            "set ::rdi::mode tcl",
+            f"set ::VMCP_PORT_PREF {port}",
+            f'source "{tcl_path.as_posix()}"',
+            'puts "LOAD_PORT=$::vmcp::active_port"',
+            "set ::rdi::mode gui",
+            "update",
+            'puts "IDLE_PORT=$::vmcp::active_port"',
+        ])
+        assert "LOAD_PORT=0" in out and f"IDLE_PORT={port}" in out, out
+
+    def test_mcp_spawned_gui_keeps_allocated_port_via_tclsh(self, tcl_path, tmp_path):
+        """MCP 拉起的 GUI:init.tcl 推迟 + -source 立即绑分配端口,延迟回调不得 rebind。"""
+        init_port = self._free_port()
+        alloc_port = self._free_port()
+        out = self._run_tclsh(tmp_path, [
+            "namespace eval ::rdi {}",
+            "set ::rdi::mode tcl",
+            f"set ::VMCP_PORT_PREF {init_port}",
+            f'source "{tcl_path.as_posix()}"',
+            "set ::rdi::mode gui",
+            f"set ::VMCP_PORT_PREF {alloc_port}",
+            f'source "{tcl_path.as_posix()}"',
+            "update",
+            'puts "IDLE_PORT=$::vmcp::active_port"',
+        ])
+        assert f"IDLE_PORT={alloc_port}" in out, out
+        assert "rebind" not in out, "延迟回调不能关掉分配端口重开"
+        assert out.count("server ready on port") == 1, out

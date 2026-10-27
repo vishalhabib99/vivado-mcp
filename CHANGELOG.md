@@ -21,6 +21,14 @@
   `{Memory Initialization Files}`、`{*}`、`{}` 等原样交给 Tcl。此前 `{}`、单独的 `}`
   会抛出未捕获的 ValueError。`{N}` 越界时返回 `[ERROR]`。兼容性:以前按旧报错写成
   `{{...}}` 的模板,现在会把双花括号原样送进 Tcl,需要改回单花括号。
+- **无界面 Vivado 不再占用 9999**(TCP server 启动时机变更):已 install 的机器上,
+  `start_session(mode="tcl")` 和 launch_runs 的 batch 子进程也会经 `Vivado_init.tcl`
+  起 server 占住 9999,之后 `mode="gui"` probe 9999 会接管到这个看不见的会话。
+  Vivado_init.tcl 阶段即使是 GUI,`::rdi::mode` 也还是 `tcl`,所以 server 脚本改为
+  `after idle` 推迟到事件循环里再判,只有 `gui` 才启动;`-source` 阶段(mode 已是 gui)
+  仍立即绑 MCP 分配的端口,延迟回调发现 server 已在就跳过。
+  真机实测(2019.1):tcl 模式 9999 空闲;手动打开的 GUI(带或不带 `-mode gui`)9999 可连;
+  `mode="gui", port=0` 只监听分配端口,无 rebind。
 
 ### 认知更正
 

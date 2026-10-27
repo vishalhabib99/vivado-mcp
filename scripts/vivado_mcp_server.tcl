@@ -8,9 +8,10 @@
 ##   - 若 Python 注入了 `set ::VMCP_PORT_PREF <port>`，绑这个**确切端口**，绑不上就退出
 ##     （绝不静默滑到别人的端口 → 杜绝"新 Vivado 监听在没人连的端口=孤儿"）。
 ##     Python 端在 spawn 前已用 socket.bind(("",0)) 抢一个空闲端口号再释放注入进来。
-##   - 若 VMCP_PORT_PREF 未定义（老 install 的 init.tcl 手动启动 / launch_runs 子进程），
+##   - 若 VMCP_PORT_PREF 未定义（老 install 的 init.tcl 手动启动），
 ##     fallback DEFAULT_PORT=9999 单端口绑 —— 保证外部 attach / list_sessions probe 不被破坏。
-## 端口占用守卫：catch socket 失败后静默退出（launch_runs 子进程用同一 init.tcl 不会冲突）
+## 端口占用守卫：catch socket 失败后静默退出
+## 模式守卫：只在 GUI 模式启动，init 阶段推迟到事件循环再判（见文件末尾）
 ## Tcl 8.5 兼容（Vivado 2019.1 使用 Tcl 8.5）
 
 namespace eval ::vmcp {
@@ -192,7 +193,7 @@ proc ::vmcp::on_accept {chan addr port} {
 
 ## 绑**确切端口**启动 server，绑不上就退出（B 方案 / 端口精确化）。
 ## 端口来自 ::VMCP_PORT_PREF（Python spawn 前注入的确切空闲端口）；
-## 未注入时 fallback DEFAULT_PORT=9999 单端口绑（老 install / launch_runs 子进程）。
+## 未注入时 fallback DEFAULT_PORT=9999 单端口绑（老 install）。
 ## 不再做"池滑动"——占用即退，绝不静默滑到别人的端口造成孤儿。
 proc ::vmcp::start {} {
     variable DEFAULT_PORT
@@ -226,12 +227,39 @@ proc ::vmcp::start {} {
         puts "vivado-mcp server ready on port $port"
         return $port
     }
-    # 端口被占用：静默退出（launch_runs 子进程场景），绝不滑到别人端口
+    # 端口被占用：静默退出（如再开一个 GUI），绝不滑到别人端口
     puts "vivado-mcp: port $port busy, exiting (not sliding to another port)"
     return 0
 }
 
-## 启动
-::vmcp::start
+## 延迟启动回调:事件循环跑起来后再判模式。
+## -source 路径已立即启动时直接跳过,不能走 rebind 把刚开好的分配端口关掉重开。
+proc ::vmcp::deferred_start {} {
+    variable server_sock
+    if {$server_sock ne ""} {
+        return
+    }
+    if {$::rdi::mode eq "gui"} {
+        ::vmcp::start
+    } else {
+        puts "vivado-mcp: $::rdi::mode mode, server not started"
+    }
+}
+
+## 启动:只在 GUI 模式起 server。
+## 已 install 的机器上 tcl/batch 模式(mode="tcl" 会话、launch_runs 子进程)也会
+## source 本脚本;不拦就会抢走 9999,mode="gui" 默认 probe 9999 时接管到这个
+## 看不见的无界面会话。
+## 但 Vivado_init.tcl 阶段即使是 GUI,::rdi::mode 也还是 "tcl",此时无法区分,
+## 只能 after idle 推迟到事件循环里再判(tcl/batch 下回调不触发或触发时不是 gui)。
+## -source 阶段 mode 已是 gui,立即启动(MCP 拉起 GUI 的分配端口走这条)。
+## ::rdi::mode 不存在(裸 tclsh)时照旧立即启动。
+## 确需在 tcl 模式 attach 的,可在该会话里手动调 ::vmcp::start。
+if {![info exists ::rdi::mode] || $::rdi::mode eq "gui"} {
+    ::vmcp::start
+} else {
+    puts "vivado-mcp: rdi::mode=$::rdi::mode at load, server start deferred (GUI only)"
+    after idle ::vmcp::deferred_start
+}
 
 ## Vivado GUI 主事件循环自动驱动 fileevent，无需 vwait
