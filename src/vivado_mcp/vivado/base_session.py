@@ -9,11 +9,41 @@
 
 from __future__ import annotations
 
+import logging
+import os
+import sys
 import time
 from abc import ABC, abstractmethod
 from enum import Enum
 
 from vivado_mcp.vivado.tcl_utils import TclResult
+
+logger = logging.getLogger(__name__)
+
+# 该变量"存在即生效"(值为 0 也一样):cmd 不再在当前目录找 .bat,
+# Vivado 2019.1 的 launch_simulation 调 compile.bat 不带路径,于是必挂。
+# Claude 客户端等父进程会注入它,MCP spawn 的 Vivado 原样继承。
+_CURDIR_POLICY_VAR = "NoDefaultCurrentDirectoryInExePath"
+
+
+def vivado_child_env() -> dict[str, str] | None:
+    """返回 spawn Vivado 用的环境;无需改动时返回 None(= 继承父进程)。
+
+    仅 Windows 上移除 ``NoDefaultCurrentDirectoryInExePath``(大小写不敏感匹配),
+    其余变量原样保留,与从开始菜单启动 Vivado 的环境一致。
+    """
+    if sys.platform != "win32":
+        return None
+    target = _CURDIR_POLICY_VAR.upper()
+    if not any(k.upper() == target for k in os.environ):
+        return None
+    env = {k: v for k, v in os.environ.items() if k.upper() != target}
+    logger.info(
+        "已从 Vivado 子进程环境移除 %s(该变量存在即阻止 cmd 在当前目录找 .bat,"
+        "launch_simulation 会挂)",
+        _CURDIR_POLICY_VAR,
+    )
+    return env
 
 
 class SessionState(str, Enum):

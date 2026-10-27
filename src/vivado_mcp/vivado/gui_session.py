@@ -29,7 +29,7 @@ from datetime import datetime
 from pathlib import Path
 
 from vivado_mcp.tcl_scripts import QUERY_CURRENT_PROJECT
-from vivado_mcp.vivado.base_session import BaseSession, SessionState
+from vivado_mcp.vivado.base_session import BaseSession, SessionState, vivado_child_env
 from vivado_mcp.vivado.tcl_utils import TclResult, clean_output, decode_vivado_output
 
 logger = logging.getLogger(__name__)
@@ -195,7 +195,7 @@ def probe_vmcp_server(host: str, port: int, timeout: float = 0.5) -> bool:
 
 def _query_current_project(
     host: str, port: int, timeout: float = _CURPROJ_TIMEOUT
-) -> str | None:
+) -> tuple[str, str] | None:
     """一次性独立短连接查询 current_project(PRD A2 横幅提示用)。
 
     **绝不走会话主连接**:主连接上的查询一旦超时,迟到的响应会残留在流上,
@@ -204,8 +204,8 @@ def _query_current_project(
     连接 → 发一帧 QUERY_CURRENT_PROJECT → 读一帧 → 关闭,失败即丢弃连接。
 
     Returns:
-        current_project 名称(无项目时为 ``""``);任何失败返回 None 并
-        logger.warning 具体原因 —— 失败只意味着 banner 无提示。
+        ``(工程名, 工程目录)``:无项目时工程名为 ``""``,目录取不到时为 ``""``;
+        任何失败返回 None 并 logger.warning 具体原因 —— 失败只意味着 banner 无提示。
     """
     payload = QUERY_CURRENT_PROJECT.encode("utf-8")
     header = len(payload).to_bytes(4, "big")
@@ -247,9 +247,15 @@ def _query_current_project(
         )
         return None
 
+    name: str | None = None
+    directory = ""
     for line in output.splitlines():
         if line.startswith("VMCP_CURPROJ:"):
-            return line[len("VMCP_CURPROJ:"):].strip()
+            name = line[len("VMCP_CURPROJ:"):].strip()
+        elif line.startswith("VMCP_CURPROJ_DIR:"):
+            directory = line[len("VMCP_CURPROJ_DIR:"):].strip()
+    if name is not None:
+        return name, directory
     logger.warning(
         "current_project 查询输出缺 VMCP_CURPROJ 标记,前 200 字: %r",
         output[:200],
@@ -547,6 +553,7 @@ class GuiSession(BaseSession):
                         stdin=asyncio.subprocess.DEVNULL,
                         stdout=launcher_log,
                         stderr=asyncio.subprocess.STDOUT,
+                        env=vivado_child_env(),
                     )
                 # 记下 pid:stop() 在 self._proc 引用因故丢失时仍能按 pid 精杀
                 self._pid = self._proc.pid
@@ -678,7 +685,9 @@ class GuiSession(BaseSession):
 
         spawn 出来的全新 GUI / 用户停在 Start Page 的 GUI 没打开任何项目
         (current_project 为空或 "New Project"),AI 直接跑 report_* 只会
-        拿到一串错。此时提示先 open_project。
+        拿到一串错。此时提示先 open_project。已打开工程时说明工程名与目录,
+        提醒 create/open_project 会切走 current_project、close_project 会关掉它
+        (2019.1 实测:create_project 不关原工程,两者同时打开),避免 AI 误动用户工程。
 
         查询走 :func:`_query_current_project` 的**一次性独立短连接**,主连接
         零接触 —— 在主连接上 execute 查询一旦超时,残留响应会让后续所有命令
@@ -687,21 +696,28 @@ class GuiSession(BaseSession):
         """
         if self._connected_port is None:
             return ""
-        proj = await asyncio.to_thread(
+        result = await asyncio.to_thread(
             _query_current_project,
             "127.0.0.1",
             self._connected_port,
             _CURPROJ_TIMEOUT,
         )
-        if proj is None:
+        if result is None:
             return ""
+        proj, directory = result
         if proj in ("", "New Project"):
             shown = proj if proj else "<无>"
             return (
                 f"\n提示: 当前 project={shown},如非预期请先 "
                 "close_project -quiet 再 open_project <绝对路径>"
             )
-        return ""
+        where = f"({directory})" if directory else ""
+        return (
+            f"\n提示: 当前 GUI 已打开工程 {proj}{where}。在此会话 create_project / "
+            "open_project 会把 current_project 切走(原工程仍打开),close_project "
+            "会关掉它;需要新工程时请先征得用户同意,或用 start_session(port=0) "
+            "另开独立实例。"
+        )
 
     async def _handshake(
         self,

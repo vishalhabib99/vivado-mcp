@@ -12,38 +12,19 @@ from vivado_mcp.server import _get_manager, mcp
 logger = logging.getLogger(__name__)
 
 
-_WIN11_24H2_BUILD = 26100  # Win 11 24H2 起,NoDefaultCurrentDirectoryInExePath 默认 = 1
-
-
-def _is_win11_24h2_or_newer() -> bool:
-    """是否 Win 11 24H2 及更新(build >= 26100)。
-
-    24H2 起微软把 ``NoDefaultCurrentDirectoryInExePath`` 默认值从 0 改成 1,即使
-    注册表里没显式写键,行为也按 1 走。识别这条边界,无键时按版本判默认。
-    """
-    if sys.platform != "win32":
-        return False
-    try:
-        return sys.getwindowsversion().build >= _WIN11_24H2_BUILD
-    except Exception:
-        return False
-
-
 def _check_win_curdir_policy() -> str:
-    """检测 Windows ``NoDefaultCurrentDirectoryInExePath`` 安全策略。
+    """检测注册表里的 Windows ``NoDefaultCurrentDirectoryInExePath``。
 
-    Win 11 24H2+ 默认开启 = 1。开启后 cmd 即使 cwd 已在脚本目录,跑 ``compile.bat``
-    (无路径前缀)也会报 "'compile.bat' 不是内部或外部命令"。Vivado 2019.1 内部
-    spawn .bat 不传完整路径,直接受此策略 block,launch_simulation 全挂(0.3.16
-    实战实测确认)。
+    该变量 **存在即生效**(值为 0 也一样,只有删除才放行):cmd 不再在当前目录找
+    ``compile.bat``,Vivado 2019.1 spawn .bat 不带路径,launch_simulation 全挂。
+    MCP spawn 的 Vivado 已在子进程环境里移除它(``vivado_child_env``);这里只为
+    attach 用户自己开的 Vivado 时提示 —— 注册表里有值,那个进程多半继承了它。
 
-    本函数 **只读** 注册表,**不改**。决策:
+    本函数 **只读** 注册表,**不改**:
 
-    1. HKCU/HKLM 任一显式 = 1 → 警告(用户/管理员显式开启)
-    2. HKCU 显式 = 0 → 不警告(用户已 opt-out,根治命令的效果)
-    3. 两处都无值 + Win 11 24H2+ → 警告(微软默认改成开,无键 = 开)
-    4. 两处都无值 + 老 Win → 不警告(老系统默认 0)
-    5. 非 Windows → 不警告
+    1. HKCU/HKLM 任一处存在该值(任意值) → 警告
+    2. 两处都不存在 → 不警告
+    3. 非 Windows → 不警告
     """
     if sys.platform != "win32":
         return ""
@@ -62,19 +43,14 @@ def _check_win_curdir_policy() -> str:
         ),
     ]
 
-    explicit_enabled_at: list[str] = []
-    explicit_disabled = False
+    found_at: list[str] = []
     for root, subkey, label in locations:
         try:
             with winreg.OpenKey(root, subkey, 0, winreg.KEY_READ) as k:
                 v, _ = winreg.QueryValueEx(k, "NoDefaultCurrentDirectoryInExePath")
-                iv = int(v)
-                if iv == 1:
-                    explicit_enabled_at.append(label)
-                elif iv == 0:
-                    explicit_disabled = True
+                found_at.append(f"{label} 值 {v}")
         except FileNotFoundError:
-            # 值不存在 → 由 fallthrough 逻辑根据 Win 版本判默认
+            # 键或值不存在 = 未设置
             pass
         except OSError as e:
             # 读失败 = 检测能力降级(可能漏警告),warning 留痕带具体原因
@@ -83,26 +59,18 @@ def _check_win_curdir_policy() -> str:
                 "检测降级: %s", label, subkey, e,
             )
 
-    if explicit_enabled_at:
-        source = f"({' + '.join(explicit_enabled_at)} = 1)"
-    elif explicit_disabled:
-        # 用户已显式关闭,不警告(根治命令已生效)
-        return ""
-    elif _is_win11_24h2_or_newer():
-        source = "(Win 11 24H2+ 默认开启,注册表未显式覆盖)"
-    else:
+    if not found_at:
         return ""
 
     return (
-        "\n⚠  警告:Windows NoDefaultCurrentDirectoryInExePath 策略已开启 "
-        f"{source}。"
-        "\n   Vivado 2019.1 spawn compile.bat 时不带路径,本策略下会报"
-        "'compile.bat 不是内部或外部命令',launch_simulation 全挂(0.3.16 实测)。"
-        "\n   根治命令(用户级,不需要管理员,只影响你自己,下次登录生效):"
-        '\n   reg add "HKCU\\Environment" /v NoDefaultCurrentDirectoryInExePath /d 0 /f'
-        "\n   或暂时在当前 cmd 临时绕过:set NoDefaultCurrentDirectoryInExePath=0"
-        "\n   MCP get_critical_warnings(run_name='sim_1') 会用 Tcl exec + 完整路径"
-        "兜底,绕开此策略,但根治更省事。"
+        "\n⚠  警告:注册表中存在 NoDefaultCurrentDirectoryInExePath "
+        f"({', '.join(found_at)})。"
+        "\n   该变量存在即生效,设成 0 无效。Vivado 2019.1 spawn compile.bat 时不带路径,"
+        "继承了它的 Vivado 跑 launch_simulation 会挂。"
+        "\n   即时绕过:在该 Vivado 的 Tcl Console 执行"
+        "\n   unset ::env(NoDefaultCurrentDirectoryInExePath)"
+        "\n   根治:删除该值(HKLM 需管理员),改完重开 Vivado:"
+        '\n   reg delete "HKCU\\Environment" /v NoDefaultCurrentDirectoryInExePath /f'
     )
 
 
@@ -202,7 +170,8 @@ async def start_session(
         )
         status = session.status_dict()
         ascii_warn = _check_ascii_paths(status.get("vivado_path") or vivado_path)
-        curdir_warn = _check_win_curdir_policy()
+        # MCP 自己 spawn 的 Vivado 已去掉该变量,只有 attach 外部进程才可能受影响
+        curdir_warn = _check_win_curdir_policy() if status["mode"] == "attach" else ""
         return (
             f"会话 '{session_id}' 已就绪（mode={status['mode']}）。\n"
             f"Vivado: {status['vivado_path']}\n"

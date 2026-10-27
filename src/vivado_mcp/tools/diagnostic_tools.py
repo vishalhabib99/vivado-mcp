@@ -177,8 +177,8 @@ async def _run_sim_bat_fallback(session, run_name: str, tail_n: int) -> str:
     1. 调 ``LAUNCH_SCRIPTS_AND_GLOB`` 触发 ``launch_simulation -scripts_only``,
        glob 出 compile/elaborate/simulate .bat
     2. 逐个 ``session.execute(RUN_BAT_STEP)`` —— **Vivado session 自己 exec**,
-       PATH 自带 vivado/bin + 完整路径绕开 Win 11 24H2
-       ``NoDefaultCurrentDirectoryInExePath`` 安全策略,这两个根因都被绕开
+       PATH 自带 vivado/bin + 完整路径绕开 ``NoDefaultCurrentDirectoryInExePath``
+       (父进程环境如 Claude 客户端注入时 Vivado 继承),这两个根因都被绕开
     3. simulate 跳过(拉 xsim/GUI 阻塞),只回带路径
 
     历史:0.3.15 用 Python subprocess(MCP 进程 spawn .bat),实测因为 MCP 进程

@@ -1101,13 +1101,17 @@ class TestPendingSpawnPorts:
 # --------------------------------------------------------------------------- #
 
 
-def _make_curproj_handler(project_name: str) -> Callable[[bytes], bytes]:
-    """握手反射 token;current_project 查询回指定项目名。"""
+def _make_curproj_handler(
+    project_name: str, project_dir: str = ""
+) -> Callable[[bytes], bytes]:
+    """握手反射 token;current_project 查询回指定项目名(及可选工程目录)。"""
 
     def handler(req: bytes) -> bytes:
         text = req.decode("utf-8", errors="replace")
         if "VMCP_CURPROJ" in text:
             out = f"VMCP_CURPROJ:{project_name}\n"
+            if project_dir:
+                out += f"VMCP_CURPROJ_DIR:{project_dir}\n"
         else:
             out = text  # 反射:握手 token 校验需要
         return json.dumps({"rc": 0, "output": out}, ensure_ascii=False).encode("utf-8")
@@ -1151,9 +1155,11 @@ class TestStartBannerProjectHint:
         finally:
             stop.set()
 
-    async def test_no_hint_for_real_project(self):
-        """反例:已打开真实项目 → 不加提示。"""
-        port, stop, _ = _serve_length_prefix(_make_curproj_handler("my_proj"))
+    async def test_hint_for_open_project_names_project_and_close_risk(self):
+        """已打开真实工程 → 横幅说明工程名 + 目录,并提醒 create/open/close 会关掉它。"""
+        port, stop, _ = _serve_length_prefix(
+            _make_curproj_handler("my_proj", "C:/work/my proj")
+        )
         try:
             sess = GuiSession(
                 vivado_path="/fake/vivado",
@@ -1163,6 +1169,27 @@ class TestStartBannerProjectHint:
             )
             banner = await sess.start(timeout=5.0)
             assert "提示: 当前 project=" not in banner
+            assert "当前 GUI 已打开工程 my_proj(C:/work/my proj)" in banner
+            assert "会把 current_project 切走" in banner
+            assert "close_project 会关掉它" in banner
+            assert "征得用户同意" in banner
+            assert "start_session(port=0)" in banner
+            await sess.stop()
+        finally:
+            stop.set()
+
+    async def test_hint_for_open_project_without_dir(self):
+        """工程目录取不到(无 VMCP_CURPROJ_DIR 行)→ 仍提示工程名,省略括号。"""
+        port, stop, _ = _serve_length_prefix(_make_curproj_handler("my_proj"))
+        try:
+            sess = GuiSession(
+                vivado_path="/fake/vivado",
+                session_id="hint-nodir",
+                port=port,
+                attach_only=False,
+            )
+            banner = await sess.start(timeout=5.0)
+            assert "当前 GUI 已打开工程 my_proj。" in banner
             await sess.stop()
         finally:
             stop.set()
@@ -1238,6 +1265,7 @@ class TestStartBannerProjectHint:
             banner = await sess.start(timeout=5.0)
             assert "GUI 会话就绪" in banner, "查询超时不能让 start 整体失败"
             assert "提示: 当前 project=" not in banner
+            assert "已打开工程" not in banner
 
             # 核心断言:第一条用户命令拿到自己的响应,不是迟到的 CURPROJ
             result = await sess.execute("puts USER_COMMAND_1", timeout=5.0)

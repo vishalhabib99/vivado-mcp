@@ -2,6 +2,33 @@
 
 ## [Unreleased]
 
+### 修复
+
+- **MCP 启动的 Vivado 跑 `launch_simulation` 必挂**:`NoDefaultCurrentDirectoryInExePath`
+  只要存在就生效,值是 0 也一样,只有删掉才放行。Claude 客户端会把它注入自己派生的进程,
+  MCP 拉起的 Vivado 原样继承,compile.bat 因此找不到。现在 gui / tcl 两种模式启动
+  Vivado 时都会从子进程环境里删掉这个变量。真机实测(Vivado 2019.1,Win 11 build 26100):
+  不手动 unset,两种模式下 `launch_simulation` 都能直接跑通。
+- **启动警告改为反映真实机制**:去掉"Win 11 24H2 默认开启"的推断。只有接管(attach)
+  非 MCP 启动的 Vivado、且注册表里存在该值(任意值)时才警告。建议改为 `reg delete`
+  删值,或在 Vivado 里 `unset ::env(NoDefaultCurrentDirectoryInExePath)`;
+  不再建议"设成 0",因为那样会让它继续生效。
+- **接管已打开工程的 GUI 时说明工程**:`start_session` 的返回信息会写出工程名和目录,
+  并提醒在该会话 create / open_project 会切走 current_project(实测 2019.1 不会关闭原工程,
+  两者同时打开)、close_project 会关掉它;需要新工程时应先征得用户同意,
+  或用 `start_session(port=0)` 另开实例。
+- **`safe_tcl` 占位符不再与 Tcl 花括号冲突**:只有 `{N}`(N 为数字)算占位符,
+  `{Memory Initialization Files}`、`{*}`、`{}` 等原样交给 Tcl。此前 `{}`、单独的 `}`
+  会抛出未捕获的 ValueError。`{N}` 越界时返回 `[ERROR]`。兼容性:以前按旧报错写成
+  `{{...}}` 的模板,现在会把双花括号原样送进 Tcl,需要改回单花括号。
+
+### 认知更正
+
+- 0.3.16 的结论"注入 env=0 不行 → cmd 只读注册表,唯一根治是改注册表"是误判。
+  env=0 不行,是因为变量仍然存在;删掉变量(Python 侧移除,或 Tcl 里 `unset ::env(...)`)
+  就能放行。本机注册表无此值,从资源管理器启动的进程里也没有这个变量,
+  "24H2 默认开启"在本机不成立。
+
 ## [0.3.26] — 2026-09-22
 
 > 本版提供 32 个 MCP 工具、11 个 Prompt 和 5 份随包分发的 Skills，

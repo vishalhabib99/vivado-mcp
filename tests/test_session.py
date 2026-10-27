@@ -336,8 +336,55 @@ class TestAsciiPathCheck:
         assert ".runs/" in warn or "输出目录" in warn
 
 
+_CURDIR_VAR = "NoDefaultCurrentDirectoryInExePath"
+
+
+def _install_fake_winreg(monkeypatch, values=None, open_error=None):
+    """用假 winreg 模拟注册表,Linux CI 上也能跑。
+
+    values: {"HKCU": 值, "HKLM": 值},缺的键 = 该处无此值。
+    open_error: OpenKey 抛出的异常(模拟读注册表失败)。
+    """
+    import sys
+    from types import SimpleNamespace
+
+    values = values or {}
+    roots = {"hkcu": "HKCU", "hklm": "HKLM"}
+
+    class FakeKey:
+        def __init__(self, label):
+            self.label = label
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def fake_open(root, subkey, *a, **kw):
+        if open_error is not None:
+            raise open_error
+        return FakeKey(roots[root])
+
+    def fake_query(key, name):
+        assert name == _CURDIR_VAR
+        if key.label not in values:
+            raise FileNotFoundError("value not set")
+        return (values[key.label], 4)
+
+    fake = SimpleNamespace(
+        HKEY_CURRENT_USER="hkcu",
+        HKEY_LOCAL_MACHINE="hklm",
+        KEY_READ=0,
+        OpenKey=fake_open,
+        QueryValueEx=fake_query,
+    )
+    monkeypatch.setitem(sys.modules, "winreg", fake)
+    monkeypatch.setattr(sys, "platform", "win32")
+
+
 class TestWinCurdirPolicyCheck:
-    """0.3.16:Win 11 24H2+ NoDefaultCurrentDirectoryInExePath 检测。"""
+    """NoDefaultCurrentDirectoryInExePath:注册表存在即警告(值为 0 也算)。"""
 
     def test_non_windows_returns_empty(self, monkeypatch):
         """非 Windows 直接空,不读注册表。"""
@@ -345,105 +392,157 @@ class TestWinCurdirPolicyCheck:
         monkeypatch.setattr(session_tools.sys, "platform", "linux")
         assert session_tools._check_win_curdir_policy() == ""
 
-    def _mock_no_registry(self, monkeypatch):
-        """两处注册表都 FileNotFoundError(无显式键)。"""
-        import sys
-
-        if sys.platform != "win32":
-            import pytest
-            pytest.skip("Windows only")
-        import winreg
-
-        def fake_open(root, subkey, *a, **kw):
-            raise FileNotFoundError("simulated empty registry")
-
-        monkeypatch.setattr(winreg, "OpenKey", fake_open)
-
-    def test_no_registry_old_win_returns_empty(self, monkeypatch):
-        """注册表无值 + 老 Win(build < 26100) → 不警告(默认 0)。"""
+    def test_no_registry_value_returns_empty(self, monkeypatch):
+        """两处都无值 → 不警告(不再按 Windows 版本推断)。"""
         from vivado_mcp.tools import session_tools
 
-        self._mock_no_registry(monkeypatch)
-        monkeypatch.setattr(
-            session_tools, "_is_win11_24h2_or_newer", lambda: False
-        )
+        _install_fake_winreg(monkeypatch, values={})
         assert session_tools._check_win_curdir_policy() == ""
 
-    def test_no_registry_win11_24h2_returns_warning(self, monkeypatch):
-        """注册表无值 + Win 11 24H2+ → 警告(默认 1,0.3.16 实测漏报的修复)。"""
+    @pytest.mark.parametrize("values", [
+        {"HKCU": 1},
+        {"HKCU": 0},
+        {"HKLM": 1},
+        {"HKCU": "0", "HKLM": 1},
+    ])
+    def test_value_present_returns_warning(self, monkeypatch, values):
+        """任一处存在该值(含 0)→ 警告,给 reg delete + unset,不给"设 0"。"""
         from vivado_mcp.tools import session_tools
 
-        self._mock_no_registry(monkeypatch)
-        monkeypatch.setattr(
-            session_tools, "_is_win11_24h2_or_newer", lambda: True
-        )
+        _install_fake_winreg(monkeypatch, values=values)
         warn = session_tools._check_win_curdir_policy()
-        assert "24H2" in warn
-        assert "reg add" in warn
+        assert _CURDIR_VAR in warn
         assert "compile.bat" in warn
+        assert "存在即生效" in warn
+        assert f'reg delete "HKCU\\Environment" /v {_CURDIR_VAR} /f' in warn
+        assert f"unset ::env({_CURDIR_VAR})" in warn
+        assert "/d 0" not in warn
+        assert "=0" not in warn
+        assert "reg add" not in warn
+        for label in values:
+            assert label in warn
 
-    def test_explicit_disabled_returns_empty(self, monkeypatch):
-        """HKCU 显式 = 0 → 不警告(用户已 opt-out,根治命令的效果)。"""
-        import sys
-
-        if sys.platform != "win32":
-            import pytest
-            pytest.skip("Windows only")
-        import winreg
+    def test_registry_oserror_logged_as_warning(self, monkeypatch, caplog):
+        """读注册表 OSError 必须 logger.warning 留痕(错误处理铁律,禁 debug)。"""
+        import logging
 
         from vivado_mcp.tools import session_tools
 
-        class FakeKey:
-            def __enter__(self):
-                return self
+        _install_fake_winreg(monkeypatch, open_error=OSError("拒绝访问(模拟)"))
+        with caplog.at_level(
+            logging.WARNING, logger="vivado_mcp.tools.session_tools"
+        ):
+            result = session_tools._check_win_curdir_policy()
 
-            def __exit__(self, *a):
-                return False
+        assert result == ""
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+        assert "读注册表" in caplog.text
+        assert "拒绝访问(模拟)" in caplog.text, "必须带具体异常信息"
 
-        monkeypatch.setattr(winreg, "OpenKey", lambda *a, **kw: FakeKey())
-        monkeypatch.setattr(
-            winreg, "QueryValueEx", lambda k, n: (0, winreg.REG_DWORD)
-        )
-        # 即使在 24H2 上,显式 = 0 也不警告
-        monkeypatch.setattr(
-            session_tools, "_is_win11_24h2_or_newer", lambda: True
-        )
-        assert session_tools._check_win_curdir_policy() == ""
-
-    def test_windows_policy_enabled_returns_warning(self, monkeypatch):
-        """注册表 =1 → 警告含 reg add 命令、键值名、根治步骤。"""
-        import sys
-
-        if sys.platform != "win32":
-            import pytest
-            pytest.skip("Windows only")
-        import winreg
+    def test_filenotfound_path_no_warning(self, monkeypatch, caplog):
+        """反例:键不存在(FileNotFoundError)走正常 fallthrough,不发 warning。"""
+        import logging
 
         from vivado_mcp.tools import session_tools
 
-        class FakeKey:
-            def __enter__(self):
-                return self
+        _install_fake_winreg(
+            monkeypatch, open_error=FileNotFoundError("no key")
+        )
+        with caplog.at_level(
+            logging.WARNING, logger="vivado_mcp.tools.session_tools"
+        ):
+            assert session_tools._check_win_curdir_policy() == ""
 
-            def __exit__(self, *a):
-                return False
+        assert "读注册表" not in caplog.text
 
-        def fake_open(root, subkey, *a, **kw):
-            return FakeKey()
 
-        def fake_query(key, name):
-            assert name == "NoDefaultCurrentDirectoryInExePath"
-            return (1, winreg.REG_DWORD)
+class TestStartSessionCurdirWarning:
+    """start_session 只在 attach 外部 Vivado 时附加注册表警告。"""
 
-        monkeypatch.setattr(winreg, "OpenKey", fake_open)
-        monkeypatch.setattr(winreg, "QueryValueEx", fake_query)
+    async def _start(self, monkeypatch, mode):
+        from types import SimpleNamespace
 
-        warn = session_tools._check_win_curdir_policy()
-        assert "NoDefaultCurrentDirectoryInExePath" in warn
-        assert "reg add" in warn
-        assert "HKCU" in warn
-        # Vivado 真根因提示
-        assert "compile.bat" in warn
+        from vivado_mcp.tools import session_tools
+
+        session = SimpleNamespace(status_dict=lambda: {
+            "mode": mode, "vivado_path": "C:/Xilinx/vivado.bat", "state": "ready",
+        })
+
+        class FakeManager:
+            async def start_session(self, **kw):
+                return session, "banner"
+
+        monkeypatch.setattr(session_tools, "_get_manager", lambda ctx: FakeManager())
+        monkeypatch.setattr(session_tools, "_check_ascii_paths", lambda p: "")
+        monkeypatch.setattr(
+            session_tools, "_check_win_curdir_policy", lambda: "\nCURDIR_WARN"
+        )
+        return await session_tools.start_session(session_id="s", mode=mode)
+
+    async def test_attach_appends_warning(self, monkeypatch):
+        assert "CURDIR_WARN" in await self._start(monkeypatch, "attach")
+
+    @pytest.mark.parametrize("mode", ["gui", "tcl"])
+    async def test_spawned_session_no_warning(self, monkeypatch, mode):
+        assert "CURDIR_WARN" not in await self._start(monkeypatch, mode)
+
+
+class TestVivadoChildEnv:
+    """vivado_child_env:spawn Vivado 时去掉 NoDefaultCurrentDirectoryInExePath。"""
+
+    def _patch(self, monkeypatch, platform, environ):
+        from types import SimpleNamespace
+
+        from vivado_mcp.vivado import base_session
+
+        # 只替换 base_session 看到的 sys / os,不影响全局
+        monkeypatch.setattr(base_session, "sys", SimpleNamespace(platform=platform))
+        monkeypatch.setattr(base_session, "os", SimpleNamespace(environ=environ))
+        return base_session
+
+    @pytest.mark.parametrize("key", [
+        _CURDIR_VAR, _CURDIR_VAR.upper(), "nodefaultcurrentdirectoryinexepath",
+    ])
+    def test_windows_removes_var_case_insensitive(self, monkeypatch, caplog, key):
+        import logging
+
+        bs = self._patch(monkeypatch, "win32", {key: "1", "PATH": "C:/x", "Foo": "bar"})
+        with caplog.at_level(logging.INFO, logger="vivado_mcp.vivado.base_session"):
+            env = bs.vivado_child_env()
+        assert env == {"PATH": "C:/x", "Foo": "bar"}
+        assert _CURDIR_VAR in caplog.text
+
+    def test_windows_var_absent_returns_none(self, monkeypatch):
+        bs = self._patch(monkeypatch, "win32", {"PATH": "C:/x"})
+        assert bs.vivado_child_env() is None
+
+    def test_non_windows_returns_none(self, monkeypatch):
+        bs = self._patch(monkeypatch, "linux", {_CURDIR_VAR: "1", "PATH": "/bin"})
+        assert bs.vivado_child_env() is None
+
+    async def test_tcl_spawn_passes_filtered_env(self, monkeypatch):
+        """SubprocessSession.start 把去掉该变量的 env 传给子进程。"""
+        from types import SimpleNamespace
+
+        from vivado_mcp.vivado import base_session
+
+        monkeypatch.setattr(base_session, "sys", SimpleNamespace(platform="win32"))
+        monkeypatch.setenv(_CURDIR_VAR, "1")
+        monkeypatch.setenv("VMCP_TEST_CANARY", "keep")
+        captured = {}
+
+        async def fake_spawn(*args, **kwargs):
+            captured.update(kwargs)
+            raise OSError("spawn blocked in test")
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_spawn)
+        session = SubprocessSession(vivado_path="/fake/vivado", session_id="envt")
+        with pytest.raises(RuntimeError, match="spawn blocked in test"):
+            await session.start(timeout=1.0)
+
+        env = captured["env"]
+        assert not any(k.upper() == _CURDIR_VAR.upper() for k in env)
+        assert any(k.upper() == "VMCP_TEST_CANARY" for k in env)
 
 
 class TestAsciiPathScopeAnnotation:
@@ -641,68 +740,6 @@ class TestStopSessionPopAfterStop:
         assert result == "会话 's2' 已关闭。"
         assert "s2" not in session_manager._sessions
         assert "s2" not in session_manager._port_map
-
-
-class TestWinCurdirPolicyOSErrorLogging:
-    """读注册表 OSError 必须 logger.warning 留痕(错误处理铁律,禁 debug)。"""
-
-    def test_registry_oserror_logged_as_warning(self, monkeypatch, caplog):
-        import logging
-        import sys
-
-        if sys.platform != "win32":
-            pytest.skip("Windows only")
-        import winreg
-
-        from vivado_mcp.tools import session_tools
-
-        def fake_open(root, subkey, *a, **kw):
-            raise OSError("拒绝访问(模拟)")
-
-        monkeypatch.setattr(winreg, "OpenKey", fake_open)
-        # 老 Win 默认 0:两处读失败 + 无显式值 → 返回空(语义不变)
-        monkeypatch.setattr(
-            session_tools, "_is_win11_24h2_or_newer", lambda: False
-        )
-
-        with caplog.at_level(
-            logging.WARNING, logger="vivado_mcp.tools.session_tools"
-        ):
-            result = session_tools._check_win_curdir_policy()
-
-        assert result == "", "读失败时返回值语义不变(降级为按版本默认判)"
-        warning_records = [
-            r for r in caplog.records if r.levelno == logging.WARNING
-        ]
-        assert warning_records, "OSError 必须以 WARNING 级别留痕"
-        assert "读注册表" in caplog.text
-        assert "拒绝访问(模拟)" in caplog.text, "必须带具体异常信息"
-
-    def test_filenotfound_path_no_warning(self, monkeypatch, caplog):
-        """反例:键不存在(FileNotFoundError)走正常 fallthrough,不发 warning。"""
-        import logging
-        import sys
-
-        if sys.platform != "win32":
-            pytest.skip("Windows only")
-        import winreg
-
-        from vivado_mcp.tools import session_tools
-
-        def fake_open(root, subkey, *a, **kw):
-            raise FileNotFoundError("no key")
-
-        monkeypatch.setattr(winreg, "OpenKey", fake_open)
-        monkeypatch.setattr(
-            session_tools, "_is_win11_24h2_or_newer", lambda: False
-        )
-
-        with caplog.at_level(
-            logging.WARNING, logger="vivado_mcp.tools.session_tools"
-        ):
-            assert session_tools._check_win_curdir_policy() == ""
-
-        assert "读注册表" not in caplog.text
 
 
 class TestTclServerScript:

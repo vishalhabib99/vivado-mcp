@@ -115,7 +115,8 @@ if {[catch {get_property target_simulator [current_project]} __ts]} {
 
 # --------------------------------------------------------------------------- #
 #  查询当前打开的 project(PRD A2:启动横幅项目提示)
-#  无项目时 current_project 直接报错 → catch 住置空。输出单行 VMCP_CURPROJ:<name>
+#  无项目时 current_project 直接报错 → catch 住置空。输出单行 VMCP_CURPROJ:<name>,
+#  有项目时再输出 VMCP_CURPROJ_DIR:<工程目录>(取不到则省略)。
 #  消费方:gui_session._query_current_project —— 走**一次性独立短连接**发送,
 #  绝不在会话主连接上跑(主连接查询超时的残留响应会让后续 execute 永久错位)。
 #  无 Python 占位符,直接用单花括号。
@@ -124,6 +125,7 @@ if {[catch {get_property target_simulator [current_project]} __ts]} {
 QUERY_CURRENT_PROJECT = """\
 if {[catch {current_project} __p]} { set __p "" }
 puts "VMCP_CURPROJ:$__p"
+if {$__p ne ""} { catch { puts "VMCP_CURPROJ_DIR:[get_property DIRECTORY [current_project]]" } }
 """
 
 # --------------------------------------------------------------------------- #
@@ -615,8 +617,9 @@ puts "VMCP_BAT_DONE"
 
 # --------------------------------------------------------------------------- #
 #  在 **Vivado session 内** exec 单步 .bat。理由:
-#    - Vivado 自己 spawn .bat 时不传完整路径,Win 11 24H2 默认开启
-#      NoDefaultCurrentDirectoryInExePath 导致 'compile.bat' not recognized
+#    - Vivado 自己 spawn .bat 时不传完整路径,父进程环境(如 Claude 客户端)注入的
+#      NoDefaultCurrentDirectoryInExePath 被 Vivado 继承后(存在即生效)导致
+#      'compile.bat' not recognized
 #    - MCP 进程的 PATH 不含 vivado/bin,Python subprocess 跑 .bat 也会 xvlog
 #      not recognized,假阳性误导诊断
 #    - **Vivado session 内** PATH 含 vivado/bin,exec cmd /c <完整路径> 既绕开

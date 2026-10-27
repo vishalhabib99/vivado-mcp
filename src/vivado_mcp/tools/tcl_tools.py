@@ -9,6 +9,8 @@
   Windows 路径含空格 / 中文 / ``$`` / ``[]`` / ``{}`` / 反斜杠也能安全执行
 """
 
+import re
+
 from mcp.server.mcpserver import Context
 
 from vivado_mcp.server import _NO_SESSION, _require_session, _safe_execute, mcp
@@ -154,6 +156,11 @@ async def run_tcl(
     return await _safe_execute(session, command, float(timeout), "命令执行失败")
 
 
+# 只有 {N}（N 为 ASCII 十进制数字）是占位符，其余花括号原样交给 Tcl。
+# 不用 \d：它会匹配全角 / 阿拉伯-印度数字，int() 也照收
+_PLACEHOLDER_RE = re.compile(r"\{([0-9]+)\}")
+
+
 @mcp.tool()
 async def safe_tcl(
     template: str,
@@ -175,8 +182,10 @@ async def safe_tcl(
     - ``safe_tcl("set_property PACKAGE_PIN {0} [get_ports {1}]",
       args=["W5", "clk"])``
 
-    template 用 Python format 的 ``{0}`` / ``{1}`` 占位符，args 中每个元素会被
-    ``tcl_quote()`` 包装成 ``"..."`` 并转义所有特殊字符。
+    template 用 ``{0}`` / ``{1}`` 占位符，args 中每个元素会被
+    ``tcl_quote()`` 包装成 ``"..."`` 并转义所有特殊字符。只有 ``{N}``（N 为数字）
+    是占位符，除此之外的花括号（如 ``{Memory Initialization Files}``、``{*}``、
+    ``{}``）原样传给 Tcl，无需 ``{{ }}`` 转义。
 
     Args:
         template: Tcl 命令模板，用 {0}/{1}/... 表示参数位置。
@@ -187,12 +196,23 @@ async def safe_tcl(
     if args is None:
         args = []
     quoted = [tcl_quote(str(a)) for a in args]
-    try:
-        cmd = template.format(*quoted)
-    except (IndexError, KeyError) as e:
+    out_of_range: list[str] = []
+
+    def _sub(m: re.Match) -> str:
+        # 超长数字先按长度判越界，避免 int() 触发 4300 位上限 ValueError
+        digits = m.group(1).lstrip("0") or "0"
+        if len(digits) <= 9 and int(digits) < len(quoted):
+            return quoted[int(digits)]
+        out_of_range.append(m.group(0))
+        return m.group(0)
+
+    cmd = _PLACEHOLDER_RE.sub(_sub, template)
+    if out_of_range:
+        bad = ", ".join(dict.fromkeys(out_of_range))
         return (
-            f"[ERROR] safe_tcl 模板占位符不匹配: {e}。"
-            f"template={template!r}, args={args!r}"
+            f"[ERROR] safe_tcl 模板占位符 {bad} 超出 args 范围"
+            f"（共 {len(args)} 个）。若这是 Tcl 字面量（如 if {{1}}），请改写"
+            f"（如 if 1 / 用变量）。template={template!r}, args={args!r}"
         )
 
     session = _require_session(ctx, session_id)

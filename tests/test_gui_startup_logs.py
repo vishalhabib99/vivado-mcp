@@ -206,6 +206,33 @@ async def test_spawn_failure_keeps_attempted_log_paths_and_closes_output(
     assert session.state == SessionState.ERROR
 
 
+async def test_spawn_env_drops_curdir_policy_var(startup_env, monkeypatch):
+    """GUI spawn 传给子进程的 env 去掉 NoDefaultCurrentDirectoryInExePath,其余保留。"""
+    from vivado_mcp.vivado import base_session
+
+    _, make_session = startup_env
+    session = make_session()
+    var = "NoDefaultCurrentDirectoryInExePath"
+    # 只让 base_session 认为在 Windows 上,不影响 GuiSession 其余平台分支
+    monkeypatch.setattr(base_session, "sys", SimpleNamespace(platform="win32"))
+    monkeypatch.setenv(var, "1")
+    monkeypatch.setenv("VMCP_TEST_CANARY", "keep")
+    captured = {}
+
+    async def fail_spawn(*args, **kwargs):
+        captured.update(kwargs)
+        raise OSError("spawn blocked in test")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fail_spawn)
+
+    with pytest.raises(RuntimeError, match="spawn blocked in test"):
+        await session.start(timeout=2.0)
+
+    env = captured["env"]
+    assert not any(k.upper() == var.upper() for k in env)
+    assert any(k.upper() == "VMCP_TEST_CANARY" for k in env)
+
+
 def _has_cp936_ansi():
     if sys.platform != "win32":
         return False

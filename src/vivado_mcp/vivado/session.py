@@ -14,7 +14,7 @@ import collections
 import logging
 import time
 
-from vivado_mcp.vivado.base_session import BaseSession, SessionState
+from vivado_mcp.vivado.base_session import BaseSession, SessionState, vivado_child_env
 from vivado_mcp.vivado.tcl_utils import (
     TclResult,
     clean_output,
@@ -89,6 +89,7 @@ class SubprocessSession(BaseSession):
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                env=vivado_child_env(),
             )
         except (OSError, FileNotFoundError) as e:
             self._state = SessionState.ERROR
