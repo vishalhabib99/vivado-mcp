@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+## [0.3.27] — 2026-10-31
+
+> 本版修复 MCP 启动的 Vivado 跑不了 `launch_simulation` 的问题,
+> 并让 `safe_tcl` 不再与 Tcl 花括号冲突、无界面 Vivado 不再占用 9999。
+
 ### 修复
 
 - **MCP 启动的 Vivado 跑 `launch_simulation` 必挂**:`NoDefaultCurrentDirectoryInExePath`
